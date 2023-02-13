@@ -8,22 +8,28 @@ import (
 	"time"
 
 	"github.com/portworx/torpedo/pkg/log"
+	"github.com/portworx/torpedo/pkg/osutils"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
 	//"github.com/portworx/torpedo/drivers/node"
+	storkapi "github.com/libopenstorage/stork/pkg/apis/stork/v1alpha1"
+	"github.com/portworx/sched-ops/k8s/apiextensions"
+	"github.com/portworx/sched-ops/k8s/core"
+	storkops "github.com/portworx/sched-ops/k8s/stork"
 	"github.com/portworx/sched-ops/task"
 	"github.com/portworx/torpedo/drivers/scheduler"
-
-	//"github.com/portworx/torpedo/drivers/scheduler/spec"
-	storkapi "github.com/libopenstorage/stork/pkg/apis/stork/v1alpha1"
-	storkops "github.com/portworx/sched-ops/k8s/stork"
+	"github.com/portworx/torpedo/drivers/scheduler/spec"
 	"github.com/portworx/torpedo/pkg/testrailuttils"
 	. "github.com/portworx/torpedo/tests"
 
 	//appsapi "k8s.io/api/apps/v1"
+
+	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
@@ -32,7 +38,9 @@ const (
 	defaultClusterPairDir  = "cluster-pair"
 	defaultClusterPairName = "remoteclusterpair"
 
-	migrationKey = "async-dr-"
+	migrationKey     = "async-dr-"
+	podRetryTimeout  = 5 * time.Minute
+	podRetryInterval = 5 * time.Second
 )
 
 // This test performs basic test of starting an application, creating cluster pair,
@@ -147,6 +155,184 @@ var _ = Describe("{MigrateDeployment}", func() {
 		AfterEachTest(contexts, testrailID, runID)
 	})
 })
+
+var _ = Describe("{MigrateConfluentKafka}", func() {
+	// var testrailID = 50803
+	// testrailID corresponds to: https://portworx.testrail.net/index.php?/cases/view/35258
+	// var runID int
+
+	var kubeConfigWritten bool
+	BeforeEach(func() {
+		if !kubeConfigWritten {
+			// Write kubeconfig files after reading from the config maps created by torpedo deploy script
+			WriteKubeconfigToFiles()
+			kubeConfigWritten = true
+		}
+		wantAllAfterSuiteActions = false
+	})
+	// JustBeforeEach(func() {
+	// 	StartTorpedoTest("MigrateDeployment", "Migration of application to destination cluster", nil, testrailID)
+	// 	runID = testrailuttils.AddRunsToMilestone(testrailID)
+	// })
+	var (
+		ns_name               = "confluent"
+		includeResourcesFlag  = true
+		startApplicationsFlag = true
+		repoName              = "confluentinc"
+		operatorName          = "confluent-operator"
+		pod_names_source      []string
+		pod_names_dest        []string
+		migrationList         []*storkapi.Migration
+	)
+	It("has to deploy crd/crs, create cluster pair, migrate crs", func() {
+		Step("Deploy applications", func() {
+			fmt.Println("Setting source config")
+			SetSourceKubeConfig()
+			for i := 0; i < Inst().GlobalScaleFactor; i++ {
+				//taskName := fmt.Sprintf("%s-%d", taskNamePrefix, i)
+				ns, err := core.Instance().GetNamespace(ns_name)
+				if err != nil {
+					log.InfoD("Creating namespace %v", ns_name)
+					nsSpec := &corev1.Namespace{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: ns_name,
+						},
+					}
+					ns, err = core.Instance().CreateNamespace(nsSpec)
+					log.FailOnError(err, "NS creation failed")
+				}
+				// log.InfoD("Task name %s\n", taskName)
+				pods_created, err := helmRepoAddandCrInstall(repoName, "https://packages.confluent.io/helm", ns.Name, operatorName, fmt.Sprintf("%v/confluent-for-kubernetes", repoName),
+					"https://raw.githubusercontent.com/confluentinc/confluent-kubernetes-examples/master/quickstart-deploy/confluent-platform.yaml")
+				log.FailOnError(err, "Pods creation failed")
+				expected_kafka_crd_list := []string{"clusterlinks.platform.confluent.io", "confluentrolebindings.platform.confluent.io", "connectors.platform.confluent.io", "connects.platform.confluent.io",
+					"controlcenters.platform.confluent.io", "kafkarestclasses.platform.confluent.io", "kafkarestproxies.platform.confluent.io", "kafkas.platform.confluent.io",
+					"kafkatopics.platform.confluent.io", "ksqldbs.platform.confluent.io", "schemaexporters.platform.confluent.io", "schemaregistries.platform.confluent.io", "schemas.platform.confluent.io", "zookeepers.platform.confluent.io"}
+				for _, pod := range pods_created.Items {
+					pod_names_source = append(pod_names_source, pod.Name)
+				}
+				err = validateCRD(expected_kafka_crd_list)
+				log.FailOnError(err, "CRD validation failed")
+				options := scheduler.ScheduleOptions{Namespace: ns.Name}
+				var emptyCtx = &scheduler.Context{
+					UID:             "",
+					ScheduleOptions: options,
+					App: &spec.AppSpec{
+						Key:      "",
+						SpecList: []interface{}{},
+					}}
+				Step("Create cluster pair between source and destination clusters", func() {
+					// Set cluster context to cluster where torpedo is running
+					ScheduleValidateClusterPair(emptyCtx, false, true, defaultClusterPairDir, false)
+				})
+				mig_name := "confluent-migration"
+				mig, err := CreateMigration(mig_name, ns.Name, defaultClusterPairName, ns.Name, &includeResourcesFlag, &startApplicationsFlag)
+				Expect(err).NotTo(HaveOccurred(),
+					fmt.Sprintf("failed to create migration: %s in namespace %s. Error: [%v]",
+						mig.Name, ns.Name, err))
+				migrationList = append(migrationList, mig)
+				err = WaitForMigration(migrationList)
+				if err == nil {
+					time.Sleep(5 * time.Minute)
+					SetDestinationKubeConfig()
+					pods_migrated, err := core.Instance().GetPods(ns.Name, nil)
+					for _, pod_mig := range pods_migrated.Items {
+						pod_names_dest = append(pod_names_dest, pod_mig.Name)
+					}
+					log.FailOnError(err, "Get pods failed")
+					bl_value := assertPods(pod_names_source, pod_names_dest)
+					dash.VerifyFatal(bl_value, true, "pods assertion")
+					err = validateCRD(expected_kafka_crd_list)
+					log.FailOnError(err, "CRD validation failed")
+					deleteCRAndUninstallCRD(repoName, "https://raw.githubusercontent.com/confluentinc/confluent-kubernetes-examples/master/quickstart-deploy/confluent-platform.yaml", ns.Name)
+				}
+				SetSourceKubeConfig()
+				err = DeleteAndWaitForMigrationDeletion(mig.Name, mig.Namespace)
+				Expect(err).NotTo(HaveOccurred(),
+					fmt.Sprintf("failed to delete migration: %s in namespace %s. Error: [%v]",
+						mig.Name, mig.Namespace, err))
+				deleteCRAndUninstallCRD(repoName, "https://raw.githubusercontent.com/confluentinc/confluent-kubernetes-examples/master/quickstart-deploy/confluent-platform.yaml", ns.Name)
+			}
+		})
+	})
+})
+
+func waitForPodToBeRunning(pods *v1.PodList) error {
+	checkPods := func() (interface{}, bool, error) {
+		isRunning := true
+		for _, p := range pods.Items {
+			if p.Status.Phase != v1.PodRunning {
+				log.Infof("Pod %s in namespace %s is pending", p.Name, p.Namespace)
+				isRunning = false
+			}
+		}
+		if isRunning {
+			return "", false, nil
+		}
+		return "", true, fmt.Errorf("some pods are still pending...")
+	}
+	_, err := task.DoRetryWithTimeout(checkPods, podRetryTimeout, podRetryInterval)
+	return err
+}
+
+func helmRepoAddandCrInstall(helm_repo_name string, helm_repo_url string, namespace string, operator_name string, operator_path string, app_yaml_url string) (*v1.PodList, error) {
+	cmd := fmt.Sprintf("helm repo add %v %v", helm_repo_name, helm_repo_url)
+	_, _, err := osutils.ExecShell(cmd)
+	log.FailOnError(err, "Repo Add failed for %v repo", helm_repo_url)
+	cmd = "helm repo update"
+	_, _, err = osutils.ExecShell(cmd)
+	log.FailOnError(err, "Helm repo update failed")
+	cmd = fmt.Sprintf("helm upgrade --install %v %v -n %v", operator_name, operator_path, namespace)
+	_, _, err = osutils.ExecShell(cmd)
+	log.FailOnError(err, "Operator install failed")
+	cmd = fmt.Sprintf("kubectl apply -f %v -n %v", app_yaml_url, namespace)
+	_, _, err = osutils.ExecShell(cmd)
+	log.FailOnError(err, "App install failed")
+	time.Sleep(5 * time.Minute)
+	podList, err := core.Instance().GetPods(namespace, nil)
+	fmt.Printf("\nPods are %v and error is %v:\n", podList, err)
+	err = waitForPodToBeRunning(podList)
+	if err != nil {
+		return nil, err
+	}
+	return podList, nil
+}
+
+func validateCRD(crdList []string) error {
+	//Generate source config path and provide to api extension
+	sourceClusterConfigPath, err := GetSourceClusterConfigPath()
+	dash.VerifyFatal(err, nil, "Getting source cluster config")
+	apiExt, err := apiextensions.NewInstanceFromConfigFile(sourceClusterConfigPath)
+	if err != nil {
+		fmt.Println(err)
+	}
+	for _, crd := range crdList {
+		err = apiExt.ValidateCRD(crd, time.Duration(1)*time.Minute, time.Duration(1)*time.Minute)
+		dash.VerifyFatal(err, nil, fmt.Sprintf("Verifying kafka CRD on source cluster: %s", crd))
+	}
+	return err
+}
+
+func deleteCRAndUninstallCRD(helm_repo_name string, app_yaml_url string, namespace string) {
+	cmd := fmt.Sprintf("kubectl delete -f %v -n %v", app_yaml_url, namespace)
+	_, _, err := osutils.ExecShell(cmd)
+	log.FailOnError(err, "App uninstall failed")
+	cmd = fmt.Sprintf("helm uninstall %v -n %v", helm_repo_name, namespace)
+	_, _, err = osutils.ExecShell(cmd)
+	log.FailOnError(err, "Operaor uninstall failed")
+}
+
+func assertPods(src_pods, dest_pods []string) bool {
+	if len(src_pods) != len(src_pods) {
+		return false
+	}
+	for i, v := range src_pods {
+		if v != dest_pods[i] {
+			return false
+		}
+	}
+	return true
+}
 
 func WriteKubeconfigToFiles() {
 	kubeconfigs := os.Getenv("KUBECONFIGS")
